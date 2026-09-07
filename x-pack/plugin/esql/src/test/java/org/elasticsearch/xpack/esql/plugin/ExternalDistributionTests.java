@@ -8,6 +8,8 @@
 package org.elasticsearch.xpack.esql.plugin;
 
 import org.elasticsearch.TransportVersion;
+import org.elasticsearch.cluster.node.DiscoveryNodeUtils;
+import org.elasticsearch.cluster.node.DiscoveryNodes;
 import org.elasticsearch.common.settings.Settings;
 import org.elasticsearch.compute.aggregation.AggregatorMode;
 import org.elasticsearch.compute.operator.topn.TopNOperator.InputOrdering;
@@ -47,7 +49,6 @@ import org.elasticsearch.xpack.esql.plan.physical.ExternalSourceExec;
 import org.elasticsearch.xpack.esql.plan.physical.FilterExec;
 import org.elasticsearch.xpack.esql.plan.physical.FragmentExec;
 import org.elasticsearch.xpack.esql.plan.physical.LimitExec;
-import org.elasticsearch.xpack.esql.plan.physical.LookupJoinExec;
 import org.elasticsearch.xpack.esql.plan.physical.PhysicalPlan;
 import org.elasticsearch.xpack.esql.plan.physical.TopNExec;
 import org.elasticsearch.xpack.esql.planner.PlannerSettings;
@@ -59,8 +60,12 @@ import org.elasticsearch.xpack.esql.stats.SearchStats;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.function.IntSupplier;
+
+import static org.elasticsearch.cluster.node.DiscoveryNodeRole.INDEX_ROLE;
+import static org.elasticsearch.cluster.node.DiscoveryNodeRole.SEARCH_ROLE;
 
 public class ExternalDistributionTests extends ESTestCase {
 
@@ -162,58 +167,8 @@ public class ExternalDistributionTests extends ESTestCase {
         );
     }
 
-    // --- Request filter warning tests (elastic/esql-planning#1158) ---
-
-    public void testIntegrateEsFilterWarnsForExternalDataset() {
-        ExternalRelation external = createExternalRelation();
-        FragmentExec fragment = new FragmentExec(external);
-
-        PhysicalPlan result = PlannerUtils.integrateEsFilterIntoFragment(fragment, QueryBuilders.termQuery("name", "foo"));
-
-        assertTrue("Expected FragmentExec, got: " + result.getClass().getSimpleName(), result instanceof FragmentExec);
-        // The filter is still stored on the fragment (unchanged, pre-existing no-op behavior for external
-        // sources); only the warning is new -- see PlannerUtils.localPlan, which only ever consumes it for EsSourceExec.
-        assertNotNull("Filter should still be stored on the fragment", ((FragmentExec) result).esFilter());
-        assertWarnings(
-            "The filter in the ES|QL query request is not applied to external dataset(s) [s3://bucket/data/*.parquet]; "
-                + "use a WHERE clause to filter rows from external datasets instead"
-        );
-    }
-
-    public void testIntegrateEsFilterWarningNamesDatasetName() {
-        ExternalRelation external = createExternalRelationWithDatasetName("my_dataset");
-        FragmentExec fragment = new FragmentExec(external);
-
-        PlannerUtils.integrateEsFilterIntoFragment(fragment, QueryBuilders.termQuery("name", "foo"));
-
-        assertWarnings(
-            "The filter in the ES|QL query request is not applied to external dataset(s) [my_dataset]; "
-                + "use a WHERE clause to filter rows from external datasets instead"
-        );
-    }
-
-    public void testIntegrateEsFilterWarningListsMultipleDistinctDatasets() {
-        ExternalRelation left = createExternalRelationWithDatasetName("dataset_a");
-        ExternalRelation right = createExternalRelationWithDatasetName("dataset_b");
-        LookupJoinExec join = new LookupJoinExec(
-            SRC,
-            new FragmentExec(left),
-            new FragmentExec(right),
-            List.of(),
-            List.of(),
-            List.of(),
-            null
-        );
-
-        PlannerUtils.integrateEsFilterIntoFragment(join, QueryBuilders.termQuery("name", "foo"));
-
-        // Both distinct datasets must be named, in encounter order, joined into a single warning
-        // rather than one warning per dataset.
-        assertWarnings(
-            "The filter in the ES|QL query request is not applied to external dataset(s) [dataset_a, dataset_b]; "
-                + "use a WHERE clause to filter rows from external datasets instead"
-        );
-    }
+    // --- integrateEsFilterIntoFragment behavior (the DSL request filter now applies to datasets via the rewrite, so the
+    // former "filter not applied to external dataset" warning was removed) ---
 
     public void testIntegrateEsFilterNoWarningWithoutEsFilter() {
         ExternalRelation external = createExternalRelation();
@@ -599,6 +554,95 @@ public class ExternalDistributionTests extends ESTestCase {
         assertEquals(1, ComputeService.externalCoalesceFloor(-3, 4));
         // An implausibly wide cluster must clamp rather than overflow.
         assertEquals(Integer.MAX_VALUE, ComputeService.externalCoalesceFloor(Integer.MAX_VALUE, 4));
+        // An index-only cluster has zero eligible remote workers, but the coordinator that ends up running the
+        // scan still fills task_concurrency drivers, so the count -- not the product -- is normalised to one.
+        assertEquals(14, ComputeService.externalCoalesceFloor(14, 0));
+    }
+
+    public void testExternalCoalesceFloorUsesEligibleWorkers() {
+        DiscoveryNodes indexOnly = DiscoveryNodes.builder()
+            .add(DiscoveryNodeUtils.builder("index-1").roles(Set.of(INDEX_ROLE)).build())
+            .build();
+        assertEquals(14, ComputeService.externalCoalesceFloor(14, indexOnly));
+
+        DiscoveryNodes mixed = DiscoveryNodes.builder()
+            .add(DiscoveryNodeUtils.builder("index-1").roles(Set.of(INDEX_ROLE)).build())
+            .add(DiscoveryNodeUtils.builder("search-1").roles(Set.of(SEARCH_ROLE)).build())
+            .add(DiscoveryNodeUtils.builder("search-2").roles(Set.of(SEARCH_ROLE)).build())
+            .build();
+        assertEquals(28, ComputeService.externalCoalesceFloor(14, mixed));
+    }
+
+    public void testLocalExternalScanResultCollapsesWhenNoGatherBoundary() {
+        List<ExternalSplit> splits = List.of(
+            new FileSplit("parquet", StoragePath.of("s3://bucket/file1.parquet"), 0, 1024, ".parquet", Map.of(), Map.of()),
+            new FileSplit("parquet", StoragePath.of("s3://bucket/file2.parquet"), 0, 1024, ".parquet", Map.of(), Map.of())
+        );
+        ExternalSourceExec source = createExternalSourceExec().withSplits(splits);
+        LimitExec limit = new LimitExec(SRC, source, new Literal(SRC, 10, DataType.INTEGER), null);
+
+        var result = ComputeService.localExternalScanResult(limit, splits, "index-1");
+
+        assertFalse(result.isDistributed());
+        assertNull(result.distributionPlan());
+        assertEquals(2, result.coordinatorSplits().size());
+        assertFalse(ComputeService.hasCollapsibleExternalExchange(result.plan()));
+    }
+
+    public void testLocalExternalScanResultSelfAssignsWhenGatherNeeded() {
+        ExternalRelation external = createExternalRelation();
+        Aggregate aggregate = new Aggregate(SRC, external, List.of(), List.of());
+        Mapper mapper = new Mapper();
+        PhysicalPlan physicalPlan = mapper.map(new Versioned<>(aggregate, TransportVersion.current()));
+        List<ExternalSplit> splits = List.of(
+            new FileSplit("parquet", StoragePath.of("s3://bucket/file1.parquet"), 0, 1024, ".parquet", Map.of(), Map.of()),
+            new FileSplit("parquet", StoragePath.of("s3://bucket/file2.parquet"), 0, 1024, ".parquet", Map.of(), Map.of())
+        );
+
+        var result = ComputeService.localExternalScanResult(physicalPlan, splits, "index-1");
+
+        assertTrue(result.isDistributed());
+        assertEquals(Set.of("index-1"), result.distributionPlan().nodeAssignments().keySet());
+        assertEquals(2, result.distributionPlan().nodeAssignments().get("index-1").size());
+        assertTrue(result.coordinatorSplits().isEmpty());
+    }
+
+    public void testHasNonEmptyExternalSplits() {
+        ExternalSourceExec source = createExternalSourceExec();
+        assertFalse(ComputeService.hasNonEmptyExternalSplits(new ComputeService.ExternalDistributionResult(source, null, List.of())));
+
+        List<ExternalSplit> splits = List.of(
+            new FileSplit("parquet", StoragePath.of("s3://bucket/file1.parquet"), 0, 1024, ".parquet", Map.of(), Map.of())
+        );
+        assertTrue(ComputeService.hasNonEmptyExternalSplits(new ComputeService.ExternalDistributionResult(source, null, splits)));
+        ExternalDistributionPlan distributed = new ExternalDistributionPlan(Map.of("search-1", splits), true);
+        assertTrue(ComputeService.hasNonEmptyExternalSplits(new ComputeService.ExternalDistributionResult(source, distributed, List.of())));
+    }
+
+    public void testRunsExternalScanLocally() {
+        ExternalSourceExec source = createExternalSourceExec();
+        List<ExternalSplit> splits = List.of(
+            new FileSplit("parquet", StoragePath.of("s3://bucket/file1.parquet"), 0, 1024, ".parquet", Map.of(), Map.of())
+        );
+
+        // No external scan at all.
+        assertFalse(runsLocally(source, null, List.of()));
+        // Collapsed onto local drivers.
+        assertTrue(runsLocally(source, null, splits));
+        // Gather-boundary self-assignment: distributed() is true, but the read still happens here.
+        assertTrue(runsLocally(source, new ExternalDistributionPlan(Map.of("index-1", splits), true), List.of()));
+        // Handed to a remote worker, which is the normal split-role path and not local.
+        assertFalse(runsLocally(source, new ExternalDistributionPlan(Map.of("search-1", splits), true), List.of()));
+        // A plan that keeps some splits here but sends others away is not local either.
+        Map<String, List<ExternalSplit>> partlyRemote = Map.of("index-1", splits, "search-1", splits);
+        assertFalse(runsLocally(source, new ExternalDistributionPlan(partlyRemote, true), List.of()));
+    }
+
+    private static boolean runsLocally(PhysicalPlan plan, ExternalDistributionPlan distribution, List<ExternalSplit> coordinatorSplits) {
+        return ComputeService.runsExternalScanLocally(
+            new ComputeService.ExternalDistributionResult(plan, distribution, coordinatorSplits),
+            "index-1"
+        );
     }
 
     // --- Field retention through local optimization tests ---

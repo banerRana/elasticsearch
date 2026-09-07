@@ -26,23 +26,10 @@ public class FormatNameResolverTests extends ESTestCase {
         assertEquals(FormatNameResolver.FORMAT_PARQUET, FormatNameResolver.resolve(Map.of("reader", "java"), "file.parquet"));
     }
 
-    public void testReaderParquetRsOverridesExtension() {
-        assumeTrue("parquet-rs reader alias requires the parquet-rs feature flag", FormatNameResolver.parquetRsEnabled());
-        assertEquals(FormatNameResolver.FORMAT_PARQUET_RS, FormatNameResolver.resolve(Map.of("reader", "parquet-rs"), "file.parquet"));
-    }
-
-    public void testReaderParquetRsUnreachableWhenDisabled() {
-        assumeFalse("only when the parquet-rs feature flag is off", FormatNameResolver.parquetRsEnabled());
-        // The public reader=parquet-rs selector is removed: the alias falls through to extension-based resolution.
-        assertEquals(FormatNameResolver.FORMAT_PARQUET, FormatNameResolver.resolve(Map.of("reader", "parquet-rs"), "file.parquet"));
-        assertNull(FormatNameResolver.readerAliasToFormat(FormatNameResolver.READER_PARQUET_RS));
-        assertFalse(FormatNameResolver.supportedReaderAliases().contains(FormatNameResolver.READER_PARQUET_RS));
-    }
-
     public void testReaderOverridesFormat() {
         assertEquals(
             FormatNameResolver.FORMAT_PARQUET,
-            FormatNameResolver.resolve(Map.of("reader", "java", "format", "parquet-rs"), "file.parquet")
+            FormatNameResolver.resolve(Map.of("reader", "java", "format", "orc"), "file.parquet")
         );
     }
 
@@ -60,6 +47,15 @@ public class FormatNameResolverTests extends ESTestCase {
 
     public void testExtensionWithFragment() {
         assertEquals("parquet", FormatNameResolver.resolve(null, "gs://bucket/file.parquet#frag"));
+    }
+
+    /**
+     * Regression test for elastic/esql-planning#1854: a dotted query value in a presigned URL caused the
+     * last-dot scan to land inside the query string, yielding the wrong extension ("2" instead of "csv").
+     */
+    public void testExtensionWithDottedQueryString() {
+        assertEquals("csv", FormatNameResolver.resolve(null, "https://host/data.csv?v=1.2"));
+        assertEquals("csv", FormatNameResolver.resolve(null, "http://host/data.csv?X-Amz-Signature=a.b"));
     }
 
     public void testFormatConfigOverridesExtension() {
@@ -103,9 +99,7 @@ public class FormatNameResolverTests extends ESTestCase {
     }
 
     public void testReaderAliasToFormat() {
-        assumeTrue("parquet-rs reader alias requires the parquet-rs feature flag", FormatNameResolver.parquetRsEnabled());
         assertEquals(FormatNameResolver.FORMAT_PARQUET, FormatNameResolver.readerAliasToFormat(FormatNameResolver.READER_JAVA));
-        assertEquals(FormatNameResolver.FORMAT_PARQUET_RS, FormatNameResolver.readerAliasToFormat(FormatNameResolver.READER_PARQUET_RS));
         assertNull(FormatNameResolver.readerAliasToFormat("unknown"));
     }
 
@@ -159,7 +153,11 @@ public class FormatNameResolverTests extends ESTestCase {
             IllegalArgumentException.class,
             () -> FormatNameResolver.resolveFormatName(null, "no_extension", registry)
         );
-        assertThat(e.getMessage(), containsString("without extension"));
+        // The extensionless case now shares the one unreadable-object message, so it names the object, the
+        // reason, and the [format] remedy rather than a bare "without extension" phrase.
+        assertThat(e.getMessage(), containsString("Cannot determine how to read"));
+        assertThat(e.getMessage(), containsString("no file extension"));
+        assertThat(e.getMessage(), containsString("[format]"));
     }
 
     /**
